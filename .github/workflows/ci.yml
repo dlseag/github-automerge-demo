@@ -35,6 +35,9 @@ jobs:
       - run: npm ci
       - name: Run tests sequentially
         run: |
+          echo "开始运行测试..."
+          start_time=$(date +%s)
+
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.duration }}" != "" ]]; then
             # 如果是手动触发并指定了持续时间，则添加额外的睡眠时间
             SLEEP_TIME=$(( ${{ github.event.inputs.duration }} * 60 ))
@@ -45,6 +48,20 @@ jobs:
           else
             # 正常运行测试
             npm test -- --runInBand
+            
+            # 计算已经花费的时间
+            end_time=$(date +%s)
+            elapsed_time=$((end_time - start_time))
+            
+            # 确保总时间至少为3分钟（180秒）
+            if [ $elapsed_time -lt 180 ]; then
+              remaining_time=$((180 - elapsed_time))
+              echo "Tests completed in ${elapsed_time} seconds, sleeping for additional ${remaining_time} seconds to ensure minimum 3 minutes build time..."
+              sleep $remaining_time
+            else
+              echo "Tests completed in ${elapsed_time} seconds, which is already more than the minimum 3 minutes."
+            fi
           fi
       - name: Display test duration
-        run: echo "Tests completed! CI pipeline should have run for about ${{ github.event.inputs.duration || '5' }} minutes"
+        run: |
+          echo "Tests completed! CI pipeline should have run for at least 3 minutes or about ${{ github.event.inputs.duration || '5' }} minutes if manually triggered."

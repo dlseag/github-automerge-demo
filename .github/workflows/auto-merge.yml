@@ -1,9 +1,20 @@
 name: Auto Merge Approved PRs
 
+# 设置目标分支变量，修改此处以更改自动合并的目标分支
+env:
+  TARGET_BRANCH: "main" # 将此值更改为您希望作为主分支的分支名称
+
 on:
   pull_request_review:
     types:
       - submitted
+  workflow_dispatch:
+    inputs:
+      base_branch:
+        description: "Target branch to consider as main/base branch"
+        required: false
+        default: "main"
+        type: string
 
 # Add explicit permissions
 permissions:
@@ -14,7 +25,7 @@ permissions:
 jobs:
   auto-merge:
     runs-on: ubuntu-latest
-    if: github.event.review.state == 'approved'
+    if: github.event.review.state == 'approved' || github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -34,12 +45,20 @@ jobs:
 
       - name: Print debug information
         run: |
-          echo "PR number: ${{ github.event.pull_request.number }}"
-          echo "PR title: ${{ github.event.pull_request.title }}"
-          echo "Review state: ${{ github.event.review.state }}"
-          echo "Reviewer: ${{ github.event.review.user.login }}"
+          echo "PR number: ${{ github.event.pull_request.number || 'N/A' }}"
+          echo "PR title: ${{ github.event.pull_request.title || 'N/A' }}"
+          echo "Review state: ${{ github.event.review.state || 'N/A' }}"
+          echo "Reviewer: ${{ github.event.review.user.login || 'N/A' }}"
           echo "Event name: ${{ github.event_name }}"
           echo "Repository: ${{ github.repository }}"
+          echo "Base branch: ${{ env.TARGET_BRANCH }}"
+
+      - name: Skip remaining steps in workflow_dispatch mode
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "Workflow was triggered manually. This is just for testing the base branch setting."
+          echo "Auto-merge functionality will not run in workflow_dispatch mode."
+          exit 0
 
       - name: Check if PR has merge conflicts
         id: check_conflicts
@@ -107,7 +126,7 @@ jobs:
           echo "Recently merged PRs:"
           echo "$RECENT_MERGES_OUTPUT"
 
-      - name: Check for recent CI failures on main
+      - name: Check for recent CI failures on base branch
         id: check_main_ci_failures
         if: steps.check_conflicts.outputs.has_conflicts != 'true' && steps.check_merge_frequency.outputs.limit_exceeded != 'true'
         env:
@@ -115,27 +134,27 @@ jobs:
         run: |
           set -e  # Exit immediately if a command exits with a non-zero status
 
-          # Check for CI failures on main in the last 6 hours
+          # Check for CI failures on base branch in the last 6 hours
           SIX_HOURS_AGO=$(date -u -d "6 hours ago" "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -v-6H "+%Y-%m-%dT%H:%M:%SZ")
-          echo "Checking for CI failures on main since $SIX_HOURS_AGO"
+          echo "Checking for CI failures on ${{ env.TARGET_BRANCH }} branch since $SIX_HOURS_AGO"
 
           # Get CI runs with error handling
           WORKFLOW_RUNS=$(gh api repos/${{ github.repository }}/actions/runs 2>/dev/null || echo '{"workflow_runs": []}')
 
-          RECENT_FAILED_CI=$(echo "$WORKFLOW_RUNS" | jq -r ".workflow_runs[] | select(.head_branch == \"main\" and .status == \"completed\" and .conclusion != \"success\" and .updated_at >= \"$SIX_HOURS_AGO\") | .id" 2>/dev/null | head -n 1 || echo "")
-            
+          RECENT_FAILED_CI=$(echo "$WORKFLOW_RUNS" | jq -r ".workflow_runs[] | select(.head_branch == \"${{ env.TARGET_BRANCH }}\" and .status == \"completed\" and .conclusion != \"success\" and .updated_at >= \"$SIX_HOURS_AGO\") | .id" 2>/dev/null | head -n 1 || echo "")
+              
           if [ -n "$RECENT_FAILED_CI" ]; then
             # Get details about the failed CI with error handling
             CI_RUN_INFO=$(gh api repos/${{ github.repository }}/actions/runs/$RECENT_FAILED_CI 2>/dev/null || echo '{"html_url": "unknown", "updated_at": "unknown"}')
             FAILED_CI_URL=$(echo "$CI_RUN_INFO" | jq -r '.html_url')
             FAILED_CI_TIME=$(echo "$CI_RUN_INFO" | jq -r '.updated_at')
             
-            echo "Found failed CI on main branch at $FAILED_CI_TIME"
+            echo "Found failed CI on ${{ env.TARGET_BRANCH }} branch at $FAILED_CI_TIME"
             echo "CI URL: $FAILED_CI_URL"
-            echo "Auto-merge blocked due to failing CI on main branch. Please fix main branch first."
+            echo "Auto-merge blocked due to failing CI on ${{ env.TARGET_BRANCH }} branch. Please fix ${{ env.TARGET_BRANCH }} branch first."
             echo "ci_failing=true" >> $GITHUB_OUTPUT
           else
-            echo "No recent CI failures on main branch. Proceeding..."
+            echo "No recent CI failures on ${{ env.TARGET_BRANCH }} branch. Proceeding..."
             echo "ci_failing=false" >> $GITHUB_OUTPUT
           fi
 
@@ -162,7 +181,7 @@ jobs:
             echo "within_hours=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Check and wait for main branch CI
+      - name: Check and wait for base branch CI
         id: check_main_ci
         if: steps.check_conflicts.outputs.has_conflicts != 'true' && steps.check_merge_frequency.outputs.limit_exceeded != 'true' && steps.check_main_ci_failures.outputs.ci_failing != 'true' && steps.check_working_hours.outputs.within_hours == 'true'
         env:
@@ -179,42 +198,43 @@ jobs:
 
           echo "PR number: $PR_NUMBER"
           echo "PR head SHA: $PR_HEAD_SHA"
+          echo "Base branch: ${{ env.TARGET_BRANCH }}"
 
-          # Check if there are running workflows on the main branch
+          # Check if there are running workflows on the base branch
           WAIT_COUNT=0
           NEEDED_REBASE=false
           MAIN_CI_COMPLETED=false
 
           while [ $WAIT_COUNT -lt $MAX_WAIT ]; do
-            echo "Checking if there are running CI workflows on main branch..."
+            echo "Checking if there are running CI workflows on ${{ env.TARGET_BRANCH }} branch..."
             
             # Get workflow runs with error handling
             WORKFLOW_RUNS=$(gh api repos/${{ github.repository }}/actions/runs 2>/dev/null || echo '{"workflow_runs": []}')
-            RUNNING_WORKFLOWS=$(echo "$WORKFLOW_RUNS" | jq -r '.workflow_runs[] | select(.head_branch == "main" and .status == "in_progress") | .id' 2>/dev/null | wc -l || echo 0)
+            RUNNING_WORKFLOWS=$(echo "$WORKFLOW_RUNS" | jq -r ".workflow_runs[] | select(.head_branch == \"${{ env.TARGET_BRANCH }}\" and .status == \"in_progress\") | .id" 2>/dev/null | wc -l || echo 0)
             
             if [ "$RUNNING_WORKFLOWS" -gt 0 ]; then
-              echo "Found $RUNNING_WORKFLOWS running workflow(s) on main branch, waiting 5 minutes before checking again..."
+              echo "Found $RUNNING_WORKFLOWS running workflow(s) on ${{ env.TARGET_BRANCH }} branch, waiting 5 minutes before checking again..."
               WAIT_COUNT=$((WAIT_COUNT + 1))
               echo "This is wait attempt $WAIT_COUNT of maximum $MAX_WAIT"
               
               # If reached maximum wait count, abort the auto-merge
               if [ $WAIT_COUNT -eq $MAX_WAIT ]; then
-                echo "Reached maximum wait time (30 minutes) and main branch CI is still running. Aborting auto-merge."
+                echo "Reached maximum wait time (30 minutes) and ${{ env.TARGET_BRANCH }} branch CI is still running. Aborting auto-merge."
                 echo "should_merge=false" >> $GITHUB_OUTPUT
                 exit 0
               fi
               
               sleep 300  # Wait 5 minutes
             else
-              echo "No running CI on main branch, proceeding to check if PR needs rebase"
+              echo "No running CI on ${{ env.TARGET_BRANCH }} branch, proceeding to check if PR needs rebase"
               MAIN_CI_COMPLETED=true
               break
             fi
           done
 
-          # If main CI completed, check if PR needs rebase
+          # If base branch CI completed, check if PR needs rebase
           if [ "$MAIN_CI_COMPLETED" = "true" ]; then
-            echo "Checking if PR branch is up-to-date with main branch..."
+            echo "Checking if PR branch is up-to-date with ${{ env.TARGET_BRANCH }} branch..."
             
             # Get PR info with error handling
             PR_INFO=$(gh api repos/${{ github.repository }}/pulls/$PR_NUMBER 2>/dev/null || echo '{"mergeable_state": "unknown"}')
@@ -223,11 +243,11 @@ jobs:
             echo "PR mergeable state: $PR_MERGEABLE_STATE"
             
             if [ "$PR_MERGEABLE_STATE" = "behind" ]; then
-              echo "PR is behind main branch and needs rebase before merging"
+              echo "PR is behind ${{ env.TARGET_BRANCH }} branch and needs rebase before merging"
               NEEDED_REBASE=true
               
-              # Try to rebase the PR branch on top of main
-              echo "Attempting to rebase PR on top of main..."
+              # Try to rebase the PR branch on top of base branch
+              echo "Attempting to rebase PR on top of ${{ env.TARGET_BRANCH }}..."
               # Use GitHub API to update the branch (equivalent of "Update branch" button in UI)
               UPDATE_RESPONSE=$(gh api -X PUT repos/${{ github.repository }}/pulls/$PR_NUMBER/update-branch 2>/dev/null || echo '{"message": "Failed to update branch"}')
               UPDATE_MESSAGE=$(echo "$UPDATE_RESPONSE" | jq -r '.message')
@@ -299,12 +319,12 @@ jobs:
                 fi
               done
               
-              # Re-check if there are running CI on main (recursive protection)
+              # Re-check if there are running CI on base branch (recursive protection)
               WORKFLOW_RUNS=$(gh api repos/${{ github.repository }}/actions/runs 2>/dev/null || echo '{"workflow_runs": []}')
-              MAIN_CI_RUNNING=$(echo "$WORKFLOW_RUNS" | jq -r '.workflow_runs[] | select(.head_branch == "main" and .status == "in_progress") | .id' 2>/dev/null | wc -l || echo 0)
+              MAIN_CI_RUNNING=$(echo "$WORKFLOW_RUNS" | jq -r ".workflow_runs[] | select(.head_branch == \"${{ env.TARGET_BRANCH }}\" and .status == \"in_progress\") | .id" 2>/dev/null | wc -l || echo 0)
               
               if [ "$MAIN_CI_RUNNING" -gt 0 ]; then
-                echo "After PR rebase, found new running workflows on main branch. Starting the check process again would create a loop."
+                echo "After PR rebase, found new running workflows on ${{ env.TARGET_BRANCH }} branch. Starting the check process again would create a loop."
                 echo "This situation requires manual intervention. Please merge manually or wait for all CI to complete."
                 echo "should_merge=false" >> $GITHUB_OUTPUT
                 exit 0

@@ -5,20 +5,38 @@ on:
     types:
       - submitted
 
+# 添加明确的权限配置
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   auto-merge:
     runs-on: ubuntu-latest
-    if: github.event.review.state == 'approved' && github.event.pull_request.user.login != 'dependabot[bot]'
+    if: github.event.review.state == 'approved'
     steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Print debug information
+        run: |
+          echo "PR number: ${{ github.event.pull_request.number }}"
+          echo "PR title: ${{ github.event.pull_request.title }}"
+          echo "Review state: ${{ github.event.review.state }}"
+          echo "Reviewer: ${{ github.event.review.user.login }}"
+
       - name: Auto-merge PR
         uses: pascalgn/automerge-action@v0.15.6
         env:
           GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
           MERGE_LABELS: "" # Allow merging PRs without specific labels
-          MERGE_METHOD: "merge" # Use merge method
+          MERGE_METHOD: "rebase" # Use rebase merge method
           MERGE_COMMIT_MESSAGE: "pull-request-title"
           MERGE_FILTER_AUTHOR: "" # All authors allowed
           MERGE_DELETE_BRANCH: "true"
-          MERGE_RETRIES: "6"
+          MERGE_RETRIES: "10"
           MERGE_RETRY_SLEEP: "10000"
           MERGE_REQUIRED_APPROVALS: "1" # Require at least one approval
+          LOG_LEVEL: "debug" # Add debug logs

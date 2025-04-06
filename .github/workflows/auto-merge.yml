@@ -23,6 +23,7 @@ jobs:
 
       - name: Set up GitHub CLI
         run: |
+          set -e  # Exit immediately if a command exits with a non-zero status
           gh --version || (
             echo "Installing GitHub CLI..."
             curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
@@ -37,21 +38,161 @@ jobs:
           echo "PR title: ${{ github.event.pull_request.title }}"
           echo "Review state: ${{ github.event.review.state }}"
           echo "Reviewer: ${{ github.event.review.user.login }}"
+          echo "Event name: ${{ github.event_name }}"
+          echo "Repository: ${{ github.repository }}"
 
-      - name: Check and wait for main branch CI
-        id: check_main_ci
+      - name: Check if PR has merge conflicts
+        id: check_conflicts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -e  # Exit immediately if a command exits with a non-zero status
+
+          # Check if PR has conflicts with target branch
+          echo "Checking if PR has merge conflicts..."
+          PR_INFO=$(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }} || echo '{"mergeable": null, "mergeable_state": "unknown"}')
+          MERGEABLE=$(echo "$PR_INFO" | jq -r '.mergeable')
+          MERGEABLE_STATE=$(echo "$PR_INFO" | jq -r '.mergeable_state')
+
+          echo "PR mergeable status: $MERGEABLE"
+          echo "PR mergeable state: $MERGEABLE_STATE"
+
+          if [ "$MERGEABLE" = "false" ] || [ "$MERGEABLE_STATE" = "dirty" ]; then
+            echo "PR has merge conflicts and cannot be automatically merged."
+            echo "has_conflicts=true" >> $GITHUB_OUTPUT
+          elif [ "$MERGEABLE" = "null" ] || [ "$MERGEABLE_STATE" = "unknown" ]; then
+            echo "Failed to get PR merge status, aborting auto-merge for safety."
+            echo "has_conflicts=true" >> $GITHUB_OUTPUT
+          else
+            echo "PR has no merge conflicts. Proceeding..."
+            echo "has_conflicts=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check recent PR merge frequency
+        id: check_merge_frequency
+        if: steps.check_conflicts.outputs.has_conflicts != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e  # Exit immediately if a command exits with a non-zero status
+
+          # Check number of PRs merged in the last 3 hours
+          THREE_HOURS_AGO=$(date -u -d "3 hours ago" "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -v-3H "+%Y-%m-%dT%H:%M:%SZ")
+          echo "Checking PRs merged since $THREE_HOURS_AGO"
+
+          # Get merged PRs with error handling
+          RECENT_MERGES_OUTPUT=$(gh api repos/${{ github.repository }}/pulls \
+            --jq ".[] | select(.merged_at != null and .merged_at >= \"$THREE_HOURS_AGO\") | .number" 2>/dev/null || echo "")
+
+          if [ -z "$RECENT_MERGES_OUTPUT" ]; then
+            echo "Failed to get merged PRs, assuming zero for safety."
+            RECENT_MERGES=0
+          else
+            RECENT_MERGES=$(echo "$RECENT_MERGES_OUTPUT" | wc -l)
+          fi
+
+          echo "Found $RECENT_MERGES PRs merged in the last 3 hours"
+
+          MAX_MERGES=10
+          if [ $RECENT_MERGES -ge $MAX_MERGES ]; then
+            echo "Rate limit exceeded: $RECENT_MERGES PRs merged in the last 3 hours (maximum is $MAX_MERGES)"
+            echo "Auto-merge paused to limit merge frequency. Please try again later or merge manually."
+            echo "limit_exceeded=true" >> $GITHUB_OUTPUT
+          else
+            echo "Merge frequency is within limits. Proceeding..."
+            echo "limit_exceeded=false" >> $GITHUB_OUTPUT
+          fi
+
+          # For diagnostics
+          echo "Recently merged PRs:"
+          echo "$RECENT_MERGES_OUTPUT"
+
+      - name: Check for recent CI failures on main
+        id: check_main_ci_failures
+        if: steps.check_conflicts.outputs.has_conflicts != 'true' && steps.check_merge_frequency.outputs.limit_exceeded != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e  # Exit immediately if a command exits with a non-zero status
+
+          # Check for CI failures on main in the last 6 hours
+          SIX_HOURS_AGO=$(date -u -d "6 hours ago" "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -v-6H "+%Y-%m-%dT%H:%M:%SZ")
+          echo "Checking for CI failures on main since $SIX_HOURS_AGO"
+
+          # Get CI runs with error handling
+          WORKFLOW_RUNS=$(gh api repos/${{ github.repository }}/actions/runs 2>/dev/null || echo '{"workflow_runs": []}')
+
+          RECENT_FAILED_CI=$(echo "$WORKFLOW_RUNS" | jq -r ".workflow_runs[] | select(.head_branch == \"main\" and .status == \"completed\" and .conclusion != \"success\" and .updated_at >= \"$SIX_HOURS_AGO\") | .id" 2>/dev/null | head -n 1 || echo "")
+            
+          if [ -n "$RECENT_FAILED_CI" ]; then
+            # Get details about the failed CI with error handling
+            CI_RUN_INFO=$(gh api repos/${{ github.repository }}/actions/runs/$RECENT_FAILED_CI 2>/dev/null || echo '{"html_url": "unknown", "updated_at": "unknown"}')
+            FAILED_CI_URL=$(echo "$CI_RUN_INFO" | jq -r '.html_url')
+            FAILED_CI_TIME=$(echo "$CI_RUN_INFO" | jq -r '.updated_at')
+            
+            echo "Found failed CI on main branch at $FAILED_CI_TIME"
+            echo "CI URL: $FAILED_CI_URL"
+            echo "Auto-merge blocked due to failing CI on main branch. Please fix main branch first."
+            echo "ci_failing=true" >> $GITHUB_OUTPUT
+          else
+            echo "No recent CI failures on main branch. Proceeding..."
+            echo "ci_failing=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check if within working hours
+        id: check_working_hours
+        if: steps.check_conflicts.outputs.has_conflicts != 'true' && steps.check_merge_frequency.outputs.limit_exceeded != 'true' && steps.check_main_ci_failures.outputs.ci_failing != 'true'
+        run: |
+          set -e  # Exit immediately if a command exits with a non-zero status
+
+          # Get current date/time in China Standard Time (UTC+8)
+          current_time=$(TZ=Asia/Shanghai date '+%H' || echo "12")  # Default to noon if error
+          current_day=$(TZ=Asia/Shanghai date '+%u' || echo "3")    # Default to Wednesday if error
+
+          echo "Current time (hour): $current_time"
+          echo "Current day (1-7, where 1 is Monday): $current_day"
+
+          # Check if it's a workday (Mon-Fri: 1-5) and between 10:00-20:00
+          if [[ $current_day -ge 1 && $current_day -le 5 && $current_time -ge 10 && $current_time -lt 20 ]]; then
+            echo "Current time is within working hours (Mon-Fri, 10:00-20:00)"
+            echo "within_hours=true" >> $GITHUB_OUTPUT
+          else
+            echo "Current time is outside working hours (Mon-Fri, 10:00-20:00)"
+            echo "Auto-merge will be skipped. Please merge manually or wait for working hours."
+            echo "within_hours=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check and wait for main branch CI
+        id: check_main_ci
+        if: steps.check_conflicts.outputs.has_conflicts != 'true' && steps.check_merge_frequency.outputs.limit_exceeded != 'true' && steps.check_main_ci_failures.outputs.ci_failing != 'true' && steps.check_working_hours.outputs.within_hours == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e  # Exit immediately if a command exits with a non-zero status
+
+          # Standard wait time for all PRs
+          MAX_WAIT=6  # Wait up to 30 minutes (6 x 5min)
+
+          # Store PR details for later
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          PR_HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          echo "PR number: $PR_NUMBER"
+          echo "PR head SHA: $PR_HEAD_SHA"
+
           # Check if there are running workflows on the main branch
           WAIT_COUNT=0
-          MAX_WAIT=6  # Wait up to 6 times, 5 minutes each, total 30 minutes
+          NEEDED_REBASE=false
+          MAIN_CI_COMPLETED=false
 
           while [ $WAIT_COUNT -lt $MAX_WAIT ]; do
             echo "Checking if there are running CI workflows on main branch..."
-            RUNNING_WORKFLOWS=$(gh api repos/${{ github.repository }}/actions/runs --jq '.workflow_runs[] | select(.head_branch == "main" and .status == "in_progress") | .id' | wc -l)
             
-            if [ $RUNNING_WORKFLOWS -gt 0 ]; then
+            # Get workflow runs with error handling
+            WORKFLOW_RUNS=$(gh api repos/${{ github.repository }}/actions/runs 2>/dev/null || echo '{"workflow_runs": []}')
+            RUNNING_WORKFLOWS=$(echo "$WORKFLOW_RUNS" | jq -r '.workflow_runs[] | select(.head_branch == "main" and .status == "in_progress") | .id' 2>/dev/null | wc -l || echo 0)
+            
+            if [ "$RUNNING_WORKFLOWS" -gt 0 ]; then
               echo "Found $RUNNING_WORKFLOWS running workflow(s) on main branch, waiting 5 minutes before checking again..."
               WAIT_COUNT=$((WAIT_COUNT + 1))
               echo "This is wait attempt $WAIT_COUNT of maximum $MAX_WAIT"
@@ -59,20 +200,132 @@ jobs:
               # If reached maximum wait count, abort the auto-merge
               if [ $WAIT_COUNT -eq $MAX_WAIT ]; then
                 echo "Reached maximum wait time (30 minutes) and main branch CI is still running. Aborting auto-merge."
-                echo "::set-output name=should_merge::false"
+                echo "should_merge=false" >> $GITHUB_OUTPUT
                 exit 0
               fi
               
               sleep 300  # Wait 5 minutes
             else
-              echo "No running CI on main branch, proceeding with auto-merge"
-              echo "::set-output name=should_merge::true"
+              echo "No running CI on main branch, proceeding to check if PR needs rebase"
+              MAIN_CI_COMPLETED=true
               break
             fi
           done
 
+          # If main CI completed, check if PR needs rebase
+          if [ "$MAIN_CI_COMPLETED" = "true" ]; then
+            echo "Checking if PR branch is up-to-date with main branch..."
+            
+            # Get PR info with error handling
+            PR_INFO=$(gh api repos/${{ github.repository }}/pulls/$PR_NUMBER 2>/dev/null || echo '{"mergeable_state": "unknown"}')
+            PR_MERGEABLE_STATE=$(echo "$PR_INFO" | jq -r '.mergeable_state')
+            
+            echo "PR mergeable state: $PR_MERGEABLE_STATE"
+            
+            if [ "$PR_MERGEABLE_STATE" = "behind" ]; then
+              echo "PR is behind main branch and needs rebase before merging"
+              NEEDED_REBASE=true
+              
+              # Try to rebase the PR branch on top of main
+              echo "Attempting to rebase PR on top of main..."
+              # Use GitHub API to update the branch (equivalent of "Update branch" button in UI)
+              UPDATE_RESPONSE=$(gh api -X PUT repos/${{ github.repository }}/pulls/$PR_NUMBER/update-branch 2>/dev/null || echo '{"message": "Failed to update branch"}')
+              UPDATE_MESSAGE=$(echo "$UPDATE_RESPONSE" | jq -r '.message')
+              echo "Update branch response: $UPDATE_MESSAGE"
+              
+              # Wait for the PR branch CI to complete after rebase
+              echo "Waiting for PR branch CI to complete after rebase..."
+              REBASE_WAIT_COUNT=0
+              MAX_REBASE_WAIT=6  # Wait up to 30 minutes (6 x 5min)
+              
+              while [ $REBASE_WAIT_COUNT -lt $MAX_REBASE_WAIT ]; do
+                echo "Checking PR branch CI status after rebase..."
+                
+                # Get latest PR info after rebase with error handling
+                LATEST_PR_INFO=$(gh api repos/${{ github.repository }}/pulls/$PR_NUMBER 2>/dev/null || echo '{"head": {"sha": "'$PR_HEAD_SHA'", "ref": "unknown"}}')
+                LATEST_PR_SHA=$(echo "$LATEST_PR_INFO" | jq -r '.head.sha')
+                
+                echo "Latest PR SHA: $LATEST_PR_SHA"
+                echo "Original PR SHA: $PR_HEAD_SHA"
+                
+                # Check if the SHA has changed (indicating update happened)
+                if [ "$LATEST_PR_SHA" != "$PR_HEAD_SHA" ]; then
+                  echo "PR branch has been updated (SHA changed from $PR_HEAD_SHA to $LATEST_PR_SHA)"
+                  
+                  # Check if there are running CI workflows for the PR branch
+                  PR_BRANCH=$(echo "$LATEST_PR_INFO" | jq -r '.head.ref')
+                  echo "PR branch name: $PR_BRANCH"
+                  
+                  # Get workflow runs for PR branch with error handling
+                  WORKFLOW_RUNS=$(gh api repos/${{ github.repository }}/actions/runs 2>/dev/null || echo '{"workflow_runs": []}')
+                  PR_CI_RUNNING=$(echo "$WORKFLOW_RUNS" | jq -r ".workflow_runs[] | select(.head_branch == \"$PR_BRANCH\" and .status == \"in_progress\") | .id" 2>/dev/null | wc -l || echo 0)
+                  
+                  if [ "$PR_CI_RUNNING" -gt 0 ]; then
+                    echo "PR branch has $PR_CI_RUNNING running CI workflow(s), waiting 5 minutes before checking again..."
+                    REBASE_WAIT_COUNT=$((REBASE_WAIT_COUNT + 1))
+                    sleep 300  # Wait 5 minutes
+                    continue
+                  fi
+                  
+                  # Check if latest commit status is success with error handling
+                  STATUSES=$(gh api repos/${{ github.repository }}/commits/$LATEST_PR_SHA/status 2>/dev/null || echo '{"state": "pending"}')
+                  STATE=$(echo "$STATUSES" | jq -r '.state')
+                  
+                  echo "PR branch CI state: $STATE"
+                  
+                  if [ "$STATE" = "success" ]; then
+                    echo "PR branch CI completed successfully after rebase"
+                    break
+                  elif [ "$STATE" = "failure" ] || [ "$STATE" = "error" ]; then
+                    echo "PR branch CI failed after rebase, aborting auto-merge"
+                    echo "should_merge=false" >> $GITHUB_OUTPUT
+                    exit 0
+                  else
+                    echo "PR branch CI is still running or pending after rebase, waiting 5 minutes before checking again..."
+                    REBASE_WAIT_COUNT=$((REBASE_WAIT_COUNT + 1))
+                    sleep 300  # Wait 5 minutes
+                  fi
+                else
+                  echo "PR branch has not been updated yet, waiting 5 minutes before checking again..."
+                  REBASE_WAIT_COUNT=$((REBASE_WAIT_COUNT + 1))
+                  sleep 300  # Wait 5 minutes
+                fi
+                
+                # If reached maximum wait count, abort the auto-merge
+                if [ $REBASE_WAIT_COUNT -eq $MAX_REBASE_WAIT ]; then
+                  echo "Reached maximum wait time (30 minutes) for PR branch CI after rebase. Aborting auto-merge."
+                  echo "should_merge=false" >> $GITHUB_OUTPUT
+                  exit 0
+                fi
+              done
+              
+              # Re-check if there are running CI on main (recursive protection)
+              WORKFLOW_RUNS=$(gh api repos/${{ github.repository }}/actions/runs 2>/dev/null || echo '{"workflow_runs": []}')
+              MAIN_CI_RUNNING=$(echo "$WORKFLOW_RUNS" | jq -r '.workflow_runs[] | select(.head_branch == "main" and .status == "in_progress") | .id' 2>/dev/null | wc -l || echo 0)
+              
+              if [ "$MAIN_CI_RUNNING" -gt 0 ]; then
+                echo "After PR rebase, found new running workflows on main branch. Starting the check process again would create a loop."
+                echo "This situation requires manual intervention. Please merge manually or wait for all CI to complete."
+                echo "should_merge=false" >> $GITHUB_OUTPUT
+                exit 0
+              fi
+            elif [ "$PR_MERGEABLE_STATE" = "unknown" ]; then
+              echo "Failed to determine if PR needs rebase. For safety, aborting auto-merge."
+              echo "should_merge=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+
+          echo "PR is ready for merge"
+          echo "should_merge=true" >> $GITHUB_OUTPUT
+
       - name: Auto-merge PR
-        if: steps.check_main_ci.outputs.should_merge != 'false'
+        if: >-
+          steps.check_conflicts.outputs.has_conflicts != 'true' && 
+          steps.check_merge_frequency.outputs.limit_exceeded != 'true' && 
+          steps.check_main_ci_failures.outputs.ci_failing != 'true' && 
+          steps.check_working_hours.outputs.within_hours == 'true' && 
+          steps.check_main_ci.outputs.should_merge != 'false'
         uses: pascalgn/automerge-action@v0.15.6
         env:
           GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"

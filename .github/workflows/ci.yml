@@ -35,7 +35,7 @@ jobs:
         env:
           GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
           MERGE_LABELS: "" # Allow merging PRs without specific labels
-          MERGE_METHOD: "squash" # Use squash merge method
+          MERGE_METHOD: "merge" # Use merge method
           MERGE_COMMIT_MESSAGE: "pull-request-title"
           MERGE_FILTER_AUTHOR: "" # All authors allowed
           MERGE_DELETE_BRANCH: "true"

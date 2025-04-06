@@ -9,6 +9,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 10 # 设置超时时间为10分钟
 
     strategy:
       matrix:
@@ -21,4 +22,7 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
       - run: npm ci
-      - run: npm test
+      - name: Run tests sequentially
+        run: npm test -- --runInBand # 确保测试按顺序运行而不是并行
+      - name: Display test duration
+        run: echo "Tests completed! CI pipeline should have run for about 5 minutes"

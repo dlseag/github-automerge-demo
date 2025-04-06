@@ -1,0 +1,24 @@
+name: Auto Merge Approved PRs
+
+on:
+  pull_request_review:
+    types:
+      - submitted
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    if: github.event.review.state == 'approved' && github.event.pull_request.user.login != 'dependabot[bot]'
+    steps:
+      - name: Auto-merge PR
+        uses: pascalgn/automerge-action@v0.15.6
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          MERGE_LABELS: "" # Allow merging PRs without specific labels
+          MERGE_METHOD: "merge" # Use merge method
+          MERGE_COMMIT_MESSAGE: "pull-request-title"
+          MERGE_FILTER_AUTHOR: "" # All authors allowed
+          MERGE_DELETE_BRANCH: "true"
+          MERGE_RETRIES: "6"
+          MERGE_RETRY_SLEEP: "10000"
+          MERGE_REQUIRED_APPROVALS: "1" # Require at least one approval

@@ -1,5 +1,7 @@
 const {
   performCalculation,
+  longRunningTask,
+  processFiles,
   add,
   subtract,
   multiply,
@@ -40,4 +42,27 @@ describe("Long running tests", () => {
     const result = await performCalculation(3000);
     expect(result).toBeGreaterThan(0);
   }, 40000); // 40 second timeout
+
+  // 添加更长时间运行的测试
+  test("executes long running task with high complexity", async () => {
+    const result = await longRunningTask(5000, 2000);
+    expect(result).toBeDefined();
+    expect(typeof result).toBe("number");
+  }, 120000); // 2分钟超时
+
+  test("processes multiple files with delays", async () => {
+    const totalSize = await processFiles(100, 2000);
+    expect(totalSize).toBeGreaterThan(0);
+  }, 120000); // 2分钟超时
+
+  test("runs sequential long operations", async () => {
+    // 按顺序运行多个耗时操作
+    const result1 = await longRunningTask(2000, 1000);
+    const result2 = await processFiles(50, 1000);
+    const result3 = await performCalculation(2000);
+
+    expect(result1).toBeDefined();
+    expect(result2).toBeGreaterThan(0);
+    expect(result3).toBeGreaterThan(0);
+  }, 180000); // 3分钟超时
 });

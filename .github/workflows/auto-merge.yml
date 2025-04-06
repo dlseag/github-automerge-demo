@@ -5,11 +5,11 @@ on:
     types:
       - submitted
 
-# 添加明确的权限配置
+# Add explicit permissions
 permissions:
   contents: write
   pull-requests: write
-  actions: read # 添加读取Actions的权限
+  actions: read # Add permission to read Actions
 
 jobs:
   auto-merge:
@@ -39,34 +39,40 @@ jobs:
           echo "Reviewer: ${{ github.event.review.user.login }}"
 
       - name: Check and wait for main branch CI
+        id: check_main_ci
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 检查main分支上是否有正在运行的工作流
+          # Check if there are running workflows on the main branch
           WAIT_COUNT=0
-          MAX_WAIT=6  # 最多等待6次，每次5分钟，总共30分钟
+          MAX_WAIT=6  # Wait up to 6 times, 5 minutes each, total 30 minutes
 
           while [ $WAIT_COUNT -lt $MAX_WAIT ]; do
-            echo "检查main分支是否有运行中的CI..."
+            echo "Checking if there are running CI workflows on main branch..."
             RUNNING_WORKFLOWS=$(gh api repos/${{ github.repository }}/actions/runs --jq '.workflow_runs[] | select(.head_branch == "main" and .status == "in_progress") | .id' | wc -l)
             
             if [ $RUNNING_WORKFLOWS -gt 0 ]; then
-              echo "发现main分支有 $RUNNING_WORKFLOWS 个正在运行的工作流，等待5分钟后重试..."
+              echo "Found $RUNNING_WORKFLOWS running workflow(s) on main branch, waiting 5 minutes before checking again..."
               WAIT_COUNT=$((WAIT_COUNT + 1))
-              echo "这是第 $WAIT_COUNT 次等待，最多等待 $MAX_WAIT 次"
-              sleep 300  # 等待5分钟
+              echo "This is wait attempt $WAIT_COUNT of maximum $MAX_WAIT"
+              
+              # If reached maximum wait count, abort the auto-merge
+              if [ $WAIT_COUNT -eq $MAX_WAIT ]; then
+                echo "Reached maximum wait time (30 minutes) and main branch CI is still running. Aborting auto-merge."
+                echo "::set-output name=should_merge::false"
+                exit 0
+              fi
+              
+              sleep 300  # Wait 5 minutes
             else
-              echo "main分支上没有运行中的CI，可以继续自动合并"
+              echo "No running CI on main branch, proceeding with auto-merge"
+              echo "::set-output name=should_merge::true"
               break
-            fi
-            
-            # 如果达到最大等待次数，显示信息但继续尝试合并
-            if [ $WAIT_COUNT -eq $MAX_WAIT ]; then
-              echo "已达到最大等待时间(30分钟)，将继续尝试合并，但可能会失败"
             fi
           done
 
       - name: Auto-merge PR
+        if: steps.check_main_ci.outputs.should_merge != 'false'
         uses: pascalgn/automerge-action@v0.15.6
         env:
           GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"

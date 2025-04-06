@@ -9,6 +9,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  actions: read # 添加读取Actions的权限
 
 jobs:
   auto-merge:
@@ -20,12 +21,50 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set up GitHub CLI
+        run: |
+          gh --version || (
+            echo "Installing GitHub CLI..."
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            sudo apt update
+            sudo apt install gh -y
+          )
+
       - name: Print debug information
         run: |
           echo "PR number: ${{ github.event.pull_request.number }}"
           echo "PR title: ${{ github.event.pull_request.title }}"
           echo "Review state: ${{ github.event.review.state }}"
           echo "Reviewer: ${{ github.event.review.user.login }}"
+
+      - name: Check and wait for main branch CI
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 检查main分支上是否有正在运行的工作流
+          WAIT_COUNT=0
+          MAX_WAIT=6  # 最多等待6次，每次5分钟，总共30分钟
+
+          while [ $WAIT_COUNT -lt $MAX_WAIT ]; do
+            echo "检查main分支是否有运行中的CI..."
+            RUNNING_WORKFLOWS=$(gh api repos/${{ github.repository }}/actions/runs --jq '.workflow_runs[] | select(.head_branch == "main" and .status == "in_progress") | .id' | wc -l)
+            
+            if [ $RUNNING_WORKFLOWS -gt 0 ]; then
+              echo "发现main分支有 $RUNNING_WORKFLOWS 个正在运行的工作流，等待5分钟后重试..."
+              WAIT_COUNT=$((WAIT_COUNT + 1))
+              echo "这是第 $WAIT_COUNT 次等待，最多等待 $MAX_WAIT 次"
+              sleep 300  # 等待5分钟
+            else
+              echo "main分支上没有运行中的CI，可以继续自动合并"
+              break
+            fi
+            
+            # 如果达到最大等待次数，显示信息但继续尝试合并
+            if [ $WAIT_COUNT -eq $MAX_WAIT ]; then
+              echo "已达到最大等待时间(30分钟)，将继续尝试合并，但可能会失败"
+            fi
+          done
 
       - name: Auto-merge PR
         uses: pascalgn/automerge-action@v0.15.6

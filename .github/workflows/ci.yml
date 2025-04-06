@@ -5,6 +5,17 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch: # 添加手动触发选项
+    inputs:
+      duration:
+        description: "测试持续时间（分钟）"
+        required: false
+        default: "5"
+        type: choice
+        options:
+          - "1"
+          - "5"
+          - "10"
 
 jobs:
   build:
@@ -23,6 +34,17 @@ jobs:
           node-version: ${{ matrix.node-version }}
       - run: npm ci
       - name: Run tests sequentially
-        run: npm test -- --runInBand # 确保测试按顺序运行而不是并行
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.duration }}" != "" ]]; then
+            # 如果是手动触发并指定了持续时间，则添加额外的睡眠时间
+            SLEEP_TIME=$(( ${{ github.event.inputs.duration }} * 60 ))
+            echo "Manual run with duration: ${{ github.event.inputs.duration }} minutes (sleep ${SLEEP_TIME}s)"
+            npm test -- --runInBand
+            echo "Tests completed, now sleeping for additional time..."
+            sleep ${SLEEP_TIME}
+          else
+            # 正常运行测试
+            npm test -- --runInBand
+          fi
       - name: Display test duration
-        run: echo "Tests completed! CI pipeline should have run for about 5 minutes"
+        run: echo "Tests completed! CI pipeline should have run for about ${{ github.event.inputs.duration || '5' }} minutes"

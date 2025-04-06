@@ -38,14 +38,117 @@ jobs:
           echo "Review state: ${{ github.event.review.state }}"
           echo "Reviewer: ${{ github.event.review.user.login }}"
 
-      - name: Check and wait for main branch CI
-        id: check_main_ci
+      - name: Check if PR has merge conflicts
+        id: check_conflicts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Check if PR has conflicts with target branch
+          PR_INFO=$(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }})
+          MERGEABLE=$(echo "$PR_INFO" | jq -r '.mergeable')
+          MERGEABLE_STATE=$(echo "$PR_INFO" | jq -r '.mergeable_state')
+
+          if [ "$MERGEABLE" = "false" ] || [ "$MERGEABLE_STATE" = "dirty" ]; then
+            echo "PR has merge conflicts and cannot be automatically merged."
+            echo "::set-output name=has_conflicts::true"
+          else
+            echo "PR has no merge conflicts. Proceeding..."
+            echo "::set-output name=has_conflicts::false"
+          fi
+
+      - name: Check recent PR merge frequency
+        id: check_merge_frequency
+        if: steps.check_conflicts.outputs.has_conflicts != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Check number of PRs merged in the last 3 hours
+          THREE_HOURS_AGO=$(date -u -d "3 hours ago" "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -v-3H "+%Y-%m-%dT%H:%M:%SZ")
+          echo "Checking PRs merged since $THREE_HOURS_AGO"
+
+          RECENT_MERGES=$(gh api repos/${{ github.repository }}/pulls \
+            --jq ".[] | select(.merged_at != null and .merged_at >= \"$THREE_HOURS_AGO\") | .number" \
+            | wc -l)
+
+          echo "Found $RECENT_MERGES PRs merged in the last 3 hours"
+
+          MAX_MERGES=10
+          if [ $RECENT_MERGES -ge $MAX_MERGES ]; then
+            echo "Rate limit exceeded: $RECENT_MERGES PRs merged in the last 3 hours (maximum is $MAX_MERGES)"
+            echo "Auto-merge paused to limit merge frequency. Please try again later or merge manually."
+            echo "::set-output name=limit_exceeded::true"
+          else
+            echo "Merge frequency is within limits. Proceeding..."
+            echo "::set-output name=limit_exceeded::false"
+          fi
+
+      - name: Check for recent CI failures on main
+        id: check_main_ci_failures
+        if: steps.check_conflicts.outputs.has_conflicts != 'true' && steps.check_merge_frequency.outputs.limit_exceeded != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Check for CI failures on main in the last 6 hours
+          SIX_HOURS_AGO=$(date -u -d "6 hours ago" "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -v-6H "+%Y-%m-%dT%H:%M:%SZ")
+          echo "Checking for CI failures on main since $SIX_HOURS_AGO"
+
+          RECENT_FAILED_CI=$(gh api repos/${{ github.repository }}/actions/runs \
+            --jq ".workflow_runs[] | select(.head_branch == \"main\" and .status == \"completed\" and .conclusion != \"success\" and .updated_at >= \"$SIX_HOURS_AGO\") | .id" \
+            | head -n 1)
+            
+          if [ -n "$RECENT_FAILED_CI" ]; then
+            # Get details about the failed CI
+            CI_RUN_INFO=$(gh api repos/${{ github.repository }}/actions/runs/$RECENT_FAILED_CI)
+            FAILED_CI_URL=$(echo "$CI_RUN_INFO" | jq -r '.html_url')
+            FAILED_CI_TIME=$(echo "$CI_RUN_INFO" | jq -r '.updated_at')
+            
+            echo "Found failed CI on main branch at $FAILED_CI_TIME"
+            echo "CI URL: $FAILED_CI_URL"
+            echo "Auto-merge blocked due to failing CI on main branch. Please fix main branch first."
+            echo "::set-output name=ci_failing::true"
+          else
+            echo "No recent CI failures on main branch. Proceeding..."
+            echo "::set-output name=ci_failing::false"
+          fi
+
+      - name: Check if within working hours
+        id: check_working_hours
+        if: steps.check_conflicts.outputs.has_conflicts != 'true' && steps.check_merge_frequency.outputs.limit_exceeded != 'true' && steps.check_main_ci_failures.outputs.ci_failing != 'true'
+        run: |
+          # Get current date/time in China Standard Time (UTC+8)
+          current_time=$(TZ=Asia/Shanghai date '+%H')
+          current_day=$(TZ=Asia/Shanghai date '+%u')
+
+          echo "Current time (hour): $current_time"
+          echo "Current day (1-7, where 1 is Monday): $current_day"
+
+          # Check if it's a workday (Mon-Fri: 1-5) and between 10:00-20:00
+          if [[ $current_day -ge 1 && $current_day -le 5 && $current_time -ge 10 && $current_time -lt 20 ]]; then
+            echo "Current time is within working hours (Mon-Fri, 10:00-20:00)"
+            echo "::set-output name=within_hours::true"
+          else
+            echo "Current time is outside working hours (Mon-Fri, 10:00-20:00)"
+            echo "Auto-merge will be skipped. Please merge manually or wait for working hours."
+            echo "::set-output name=within_hours::false"
+          fi
+
+      - name: Check and wait for main branch CI
+        id: check_main_ci
+        if: steps.check_conflicts.outputs.has_conflicts != 'true' && steps.check_merge_frequency.outputs.limit_exceeded != 'true' && steps.check_main_ci_failures.outputs.ci_failing != 'true' && steps.check_working_hours.outputs.within_hours == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Standard wait time for all PRs
+          MAX_WAIT=6  # Wait up to 30 minutes (6 x 5min)
+
+          # Store PR details for later
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          PR_HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
           # Check if there are running workflows on the main branch
           WAIT_COUNT=0
-          MAX_WAIT=6  # Wait up to 6 times, 5 minutes each, total 30 minutes
+          NEEDED_REBASE=false
+          MAIN_CI_COMPLETED=false
 
           while [ $WAIT_COUNT -lt $MAX_WAIT ]; do
             echo "Checking if there are running CI workflows on main branch..."
@@ -65,14 +168,104 @@ jobs:
               
               sleep 300  # Wait 5 minutes
             else
-              echo "No running CI on main branch, proceeding with auto-merge"
-              echo "::set-output name=should_merge::true"
+              echo "No running CI on main branch, proceeding to check if PR needs rebase"
+              MAIN_CI_COMPLETED=true
               break
             fi
           done
 
+          # If main CI completed, check if PR needs rebase
+          if [ "$MAIN_CI_COMPLETED" = "true" ]; then
+            echo "Checking if PR branch is up-to-date with main branch..."
+            PR_MERGEABLE_STATE=$(gh api repos/${{ github.repository }}/pulls/$PR_NUMBER --jq '.mergeable_state')
+            
+            if [ "$PR_MERGEABLE_STATE" = "behind" ]; then
+              echo "PR is behind main branch and needs rebase before merging"
+              NEEDED_REBASE=true
+              
+              # Try to rebase the PR branch on top of main
+              echo "Attempting to rebase PR on top of main..."
+              # Use GitHub API to update the branch (equivalent of "Update branch" button in UI)
+              UPDATE_RESPONSE=$(gh api -X PUT repos/${{ github.repository }}/pulls/$PR_NUMBER/update-branch)
+              
+              # Wait for the PR branch CI to complete after rebase
+              echo "Waiting for PR branch CI to complete after rebase..."
+              REBASE_WAIT_COUNT=0
+              MAX_REBASE_WAIT=6  # Wait up to 30 minutes (6 x 5min)
+              
+              while [ $REBASE_WAIT_COUNT -lt $MAX_REBASE_WAIT ]; do
+                echo "Checking PR branch CI status after rebase..."
+                
+                # Get latest PR info after rebase
+                LATEST_PR_INFO=$(gh api repos/${{ github.repository }}/pulls/$PR_NUMBER)
+                LATEST_PR_SHA=$(echo "$LATEST_PR_INFO" | jq -r '.head.sha')
+                
+                # Check if the SHA has changed (indicating update happened)
+                if [ "$LATEST_PR_SHA" != "$PR_HEAD_SHA" ]; then
+                  echo "PR branch has been updated (SHA changed from $PR_HEAD_SHA to $LATEST_PR_SHA)"
+                  
+                  # Check if there are running CI workflows for the PR branch
+                  PR_BRANCH=$(echo "$LATEST_PR_INFO" | jq -r '.head.ref')
+                  PR_CI_RUNNING=$(gh api repos/${{ github.repository }}/actions/runs --jq ".workflow_runs[] | select(.head_branch == \"$PR_BRANCH\" and .status == \"in_progress\") | .id" | wc -l)
+                  
+                  if [ $PR_CI_RUNNING -gt 0 ]; then
+                    echo "PR branch has $PR_CI_RUNNING running CI workflow(s), waiting 5 minutes before checking again..."
+                    REBASE_WAIT_COUNT=$((REBASE_WAIT_COUNT + 1))
+                    sleep 300  # Wait 5 minutes
+                    continue
+                  fi
+                  
+                  # Check if latest commit status is success
+                  STATUSES=$(gh api repos/${{ github.repository }}/commits/$LATEST_PR_SHA/status)
+                  STATE=$(echo "$STATUSES" | jq -r '.state')
+                  
+                  if [ "$STATE" = "success" ]; then
+                    echo "PR branch CI completed successfully after rebase"
+                    break
+                  elif [ "$STATE" = "failure" ] || [ "$STATE" = "error" ]; then
+                    echo "PR branch CI failed after rebase, aborting auto-merge"
+                    echo "::set-output name=should_merge::false"
+                    exit 0
+                  else
+                    echo "PR branch CI is still running or pending after rebase, waiting 5 minutes before checking again..."
+                    REBASE_WAIT_COUNT=$((REBASE_WAIT_COUNT + 1))
+                    sleep 300  # Wait 5 minutes
+                  fi
+                else
+                  echo "PR branch has not been updated yet, waiting 5 minutes before checking again..."
+                  REBASE_WAIT_COUNT=$((REBASE_WAIT_COUNT + 1))
+                  sleep 300  # Wait 5 minutes
+                fi
+                
+                # If reached maximum wait count, abort the auto-merge
+                if [ $REBASE_WAIT_COUNT -eq $MAX_REBASE_WAIT ]; then
+                  echo "Reached maximum wait time (30 minutes) for PR branch CI after rebase. Aborting auto-merge."
+                  echo "::set-output name=should_merge::false"
+                  exit 0
+                fi
+              done
+              
+              # Re-check if there are running CI on main (recursive protection)
+              MAIN_CI_RUNNING=$(gh api repos/${{ github.repository }}/actions/runs --jq '.workflow_runs[] | select(.head_branch == "main" and .status == "in_progress") | .id' | wc -l)
+              if [ $MAIN_CI_RUNNING -gt 0 ]; then
+                echo "After PR rebase, found new running workflows on main branch. Starting the check process again would create a loop."
+                echo "This situation requires manual intervention. Please merge manually or wait for all CI to complete."
+                echo "::set-output name=should_merge::false"
+                exit 0
+              fi
+            fi
+          fi
+
+          echo "PR is ready for merge"
+          echo "::set-output name=should_merge::true"
+
       - name: Auto-merge PR
-        if: steps.check_main_ci.outputs.should_merge != 'false'
+        if: >-
+          steps.check_conflicts.outputs.has_conflicts != 'true' && 
+          steps.check_merge_frequency.outputs.limit_exceeded != 'true' && 
+          steps.check_main_ci_failures.outputs.ci_failing != 'true' && 
+          steps.check_working_hours.outputs.within_hours == 'true' && 
+          steps.check_main_ci.outputs.should_merge != 'false'
         uses: pascalgn/automerge-action@v0.15.6
         env:
           GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"

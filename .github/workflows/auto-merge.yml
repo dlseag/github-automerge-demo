@@ -339,7 +339,7 @@ jobs:
           echo "PR is ready for merge"
           echo "should_merge=true" >> $GITHUB_OUTPUT
 
-      - name: Lock PR during auto-merge
+      - name: Prepare for auto-merge
         if: >-
           steps.check_conflicts.outputs.has_conflicts != 'true' && 
           steps.check_merge_frequency.outputs.limit_exceeded != 'true' && 
@@ -349,11 +349,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # 首先添加自动合并中的评论
+          echo "Adding comment about auto-merge process..."
+          gh pr comment ${{ github.event.pull_request.number }} --body "此 PR 正在由自动合并工作流处理中，将临时锁定以防止手动合并。"
+
+          # 然后锁定 PR
           echo "Locking PR to prevent manual merges during auto-merge process..."
           gh pr lock ${{ github.event.pull_request.number }}
-
-          # 添加自动合并中的评论
-          gh pr comment ${{ github.event.pull_request.number }} --body "此 PR 正在由自动合并工作流处理中，临时锁定以防止手动合并。"
 
       - name: Auto-merge PR
         id: auto_merge

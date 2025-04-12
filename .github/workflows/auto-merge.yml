@@ -339,7 +339,21 @@ jobs:
           echo "PR is ready for merge"
           echo "should_merge=true" >> $GITHUB_OUTPUT
 
+      - name: Lock PR during auto-merge
+        if: >-
+          steps.check_conflicts.outputs.has_conflicts != 'true' && 
+          steps.check_merge_frequency.outputs.limit_exceeded != 'true' && 
+          steps.check_main_ci_failures.outputs.ci_failing != 'true' && 
+          steps.check_working_hours.outputs.within_hours == 'true' && 
+          steps.check_main_ci.outputs.should_merge != 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Locking PR to prevent manual merges during auto-merge process..."
+          gh pr lock ${{ github.event.pull_request.number }} --reason "The PR is being automatically merged by the workflow."
+
       - name: Auto-merge PR
+        id: auto_merge
         if: >-
           steps.check_conflicts.outputs.has_conflicts != 'true' && 
           steps.check_merge_frequency.outputs.limit_exceeded != 'true' && 
@@ -358,3 +372,11 @@ jobs:
           MERGE_RETRY_SLEEP: "10000"
           MERGE_REQUIRED_APPROVALS: "1" # Require at least one approval
           LOG_LEVEL: "debug" # Add debug logs
+
+      - name: Unlock PR after auto-merge attempt
+        if: always() && github.event.pull_request.number
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Unlocking PR after auto-merge process..."
+          gh pr unlock ${{ github.event.pull_request.number }} || echo "Failed to unlock PR or PR already unlocked"

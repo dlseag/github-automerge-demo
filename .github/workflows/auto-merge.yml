@@ -350,7 +350,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "Locking PR to prevent manual merges during auto-merge process..."
-          gh pr lock ${{ github.event.pull_request.number }} --reason "The PR is being automatically merged by the workflow."
+          gh pr lock ${{ github.event.pull_request.number }}
+
+          # 添加自动合并中的评论
+          gh pr comment ${{ github.event.pull_request.number }} --body "此 PR 正在由自动合并工作流处理中，临时锁定以防止手动合并。"
 
       - name: Auto-merge PR
         id: auto_merge

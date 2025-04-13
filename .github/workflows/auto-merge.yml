@@ -172,7 +172,7 @@ jobs:
           echo "Current day (1-7, where 1 is Monday): $current_day"
 
           # Check if it's between 10:00-22:00 on any day of the week
-          if [[ $current_time -ge 10 && $current_time -lt 22 ]]; then
+          if [[ $current_time -ge 8 && $current_time -lt 22 ]]; then
             echo "Current time is within working hours (10:00-22:00)"
             echo "within_hours=true" >> $GITHUB_OUTPUT
           else

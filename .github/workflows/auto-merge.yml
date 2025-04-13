@@ -171,12 +171,16 @@ jobs:
           echo "Current time (hour): $current_time"
           echo "Current day (1-7, where 1 is Monday): $current_day"
 
-          # Check if it's between 10:00-22:00 on any day of the week
-          if [[ $current_time -ge 08 && $current_time -lt 22 ]]; then
-            echo "Current time is within working hours (10:00-22:00)"
+          # 去掉前导零以避免bash将其解释为八进制
+          current_time_num=$((10#$current_time))
+          echo "Current time as number: $current_time_num"
+
+          # Check if it's between 08:00-22:00 on any day of the week
+          if [[ $current_time_num -ge 8 && $current_time_num -lt 22 ]]; then
+            echo "Current time is within working hours (08:00-22:00)"
             echo "within_hours=true" >> $GITHUB_OUTPUT
           else
-            echo "Current time is outside working hours (10:00-22:00)"
+            echo "Current time is outside working hours (08:00-22:00)"
             echo "Auto-merge will be skipped. Please merge manually or wait for working hours."
             echo "within_hours=false" >> $GITHUB_OUTPUT
           fi
